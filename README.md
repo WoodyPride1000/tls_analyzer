@@ -30,7 +30,7 @@
 
 1. リポジトリをクローン：
    ```bash
-   git clone https://github.com/yourusername/tls-analyzer.git
+   git clone https://github.com/＊＊＊＊＊＊＊＊＊＊/tls-analyzer.git
    cd tls-analyzer
 ```
 
