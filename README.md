@@ -32,29 +32,29 @@
    ```bash
    git clone https://github.com/yourusername/tls-analyzer.git
    cd tls-analyzer
-
+```
 
 ##　環境を作成（推奨）：
   ```bash
   python -m venv venv
   source venv/bin/activate  # Linux/Mac
   venv\Scripts\activate     # Windows
-
+```
 ##　依存パッケージをインストール：
   ```bash
   pip install -r requirements.txt
-
+```
 
 使用方法
 MITMproxyでアドオンを実行：
   ```bash
   mitmproxy -s tls_analyzer.py
-
+```
 
 または、Webインターフェースを使用：
   ```bash
   mitmweb -s tls_analyzer.py
-
+```
 
 出力ディレクトリ（tls_logs/）：
 ログ：tls_log_YYYYMMDD_HHMMSS_NNN.json(.gz)
@@ -86,6 +86,7 @@ JSONログ：
   "sni": "example.com",
   "tls_extensions": ["server_name", "supported_versions"]
 }
+```
 
 メトリクスログ：
 ```
@@ -93,12 +94,12 @@ JSONログ：
 2025-05-30 12:15:01 - Metric: saved_certs = 1
 2025-05-30 12:15:01 - Debug: Set permissions 0o600 for tls_logs/cert_example_com_chain00_abc123_001.pem
 2025-05-30 12:15:05 - Metric: cert_successful_retries = 1
-
+```
 テスト
 テストはtls_analyzer.pyに統合されています。実行方法：
 ```bash
 python -m unittest tls_analyzer.py
-
+```
 
 テストケース：
 ファイル名サニタイズ（sanitize_filename）
@@ -125,6 +126,8 @@ SQLiteはWALモードで同時性向上。超高負荷ではPostgreSQLを検討�
 ```python
 from sqlalchemy import create_engine
 engine = create_engine('postgresql://user:pass@localhost/db')
+```
+
 
 セキュリティ
 パーミッション：ディレクトリ（0o700）、証明書（0o600）。Windowsでは0o666にフォールバック。
@@ -133,7 +136,7 @@ ACL：WindowsでACLが必要な場合、以下を検討：
 ```python
 import win32security
 # ACL設定（実装例はドキュメント参照）
-
+```
 暗号化：ログとDBはgpgなどで暗号化推奨。
 
 パフォーマンス
