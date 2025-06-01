@@ -2,7 +2,6 @@
 
 [![Python](https://img.shields.io/badge/Python-3.8+-blue.svg)](https://www.python.org)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
-[![Tests](https://github.com/yourusername/tls-analyzer/actions/workflows/ci.yml/badge.svg)](https://github.com/yourusername/tls-analyzer/actions)
 
 **TLS Analyzer**は、MITMproxy用のアドオンとして、TLSハンドシェイクを処理し、ログと証明書を効率的に記録します。JSONまたはCSV形式のログ、証明書（`.pem`）、SQLiteデータベース（証明書管理）、メトリクスログを生成し、高耐障害性とクロスプラットフォーム対応を実現します。
 
