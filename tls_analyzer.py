@@ -43,7 +43,7 @@ def sanitize_filename(name: str, max_length: int = 150) -> str:
         max_length: 最大長（拡張子を含む）。
 
     Returns:
-        サニタイズ済みのファイル名。
+         サニタイズ済みのファイル名。
     """
     if not name or name.isspace():
         return "unknown"
