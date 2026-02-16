@@ -1,0 +1,376 @@
+import json
+import os
+import re
+import hashlib
+import threading
+import time
+import gzip
+import shutil
+import queue
+import sqlite3
+import psutil
+import logging
+import csv
+import io
+import asyncio
+import platform
+from collections import OrderedDict
+from datetime import datetime, timezone
+from contextlib import contextmanager
+
+from cryptography import x509
+from cryptography.hazmat.backends import default_backend
+from cryptography.x509.oid import NameOID
+import aiofiles
+
+# mitmproxy 関連 (実行環境に依存)
+try:
+    from mitmproxy import ctx
+    from mitmproxy.net import tls
+except ImportError:
+    # ユニットテストやスタンドアロン実行用のモック
+    class MockCtx:
+        def log(self): pass
+    ctx = MockCtx()
+
+# --- 定数 ---
+DEFAULT_ROLLOVER_INTERVAL_SEC = 300
+DEFAULT_BUFFER_MAX_SIZE = 2000
+DEFAULT_MAX_RETRIES = 3
+DEFAULT_CERT_BUFFER_MAX_SIZE = 500
+
+# --- ヘルパー関数 ---
+
+def sanitize_filename(name: str, max_length: int = 150) -> str:
+    if not name or name.isspace():
+        return "unknown"
+    base_name, ext = os.path.splitext(name)
+    ext = ext[:10]
+    sanitized = re.sub(r'[^a-zA-Z0-9_\-\.]', '_', base_name)
+    sanitized = re.sub(r'_+', '_', sanitized)
+    if sanitized in {'.', '..'}:
+        sanitized = f"invalid_{sanitized}"
+    max_base_length = max(10, max_length - len(ext))
+    return sanitized[:max_base_length] + ext
+
+def get_available_memory_mb() -> int:
+    return psutil.virtual_memory().available // (1024 * 1024)
+
+def is_windows() -> bool:
+    return platform.system() == "Windows"
+
+def escape_csv_field(value) -> str:
+    if value is None: return ''
+    output = io.StringIO()
+    writer = csv.writer(output, quoting=csv.QUOTE_MINIMAL)
+    writer.writerow([value])
+    return output.getvalue().strip()
+
+# --- モニタリングロガー ---
+
+class MetricsLogger:
+    def __init__(self, log_dir: str, metrics_file: str = "metrics.log"):
+        self.log_dir = log_dir
+        os.makedirs(self.log_dir, exist_ok=True, mode=0o700)
+        self.metrics_file = os.path.join(log_dir, metrics_file)
+        self.logger = logging.getLogger("MetricsLogger")
+        if not self.logger.handlers:
+            handler = logging.FileHandler(self.metrics_file)
+            handler.setFormatter(logging.Formatter('%(asctime)s - %(message)s'))
+            self.logger.addHandler(handler)
+            self.logger.setLevel(logging.INFO)
+        self.retry_counts = {}
+        self.successful_retries = 0
+        self.compression_failures = 0
+
+    def log_metric(self, metric_name: str, value: float) -> None:
+        self.logger.info(f"Metric: {metric_name} = {value}")
+
+    def log_retry_attempt(self, retries_attempted: int, success: bool = False, is_cert: bool = False) -> None:
+        prefix = "cert_" if is_cert else ""
+        if success:
+            self.successful_retries += 1
+            self.log_metric(f"{prefix}successful_retries", self.successful_retries)
+        else:
+            self.retry_counts[retries_attempted] = self.retry_counts.get(retries_attempted, 0) + 1
+            self.logger.info(f"Metric: {prefix}retry_attempt_count retries={retries_attempted} count={self.retry_counts[retries_attempted]}")
+
+    def log_compression_failure(self, filename: str) -> None:
+        self.compression_failures += 1
+        self.logger.info(f"Metric: compression_failure file={filename} count={self.compression_failures}")
+
+    def stop(self):
+        for handler in self.logger.handlers:
+            handler.close()
+        self.logger.handlers = []
+
+# --- バッファリングロガー ベースクラス ---
+
+class BufferedLogWriter:
+    MIN_BUFFER_SIZE = 100
+    MAX_BUFFER_SIZE = 5000
+    MEMORY_THRESHOLD_MB = 100
+    BACKOFF_INITIAL_MS = 100
+    FIELD_ORDER = [
+        "timestamp", "log_time_utc", "client_ip", "client_port",
+        "server_ip", "server_port", "tls_version", "cipher_suite",
+        "server_common_name", "issuer_common_name", "handshake_time_ms",
+        "sni", "tls_extensions"
+    ]
+
+    def __init__(
+        self,
+        log_dir: str = "tls_logs",
+        rollover_interval_sec: int = DEFAULT_ROLLOVER_INTERVAL_SEC,
+        buffer_max_size: int = DEFAULT_BUFFER_MAX_SIZE,
+        max_retries: int = DEFAULT_MAX_RETRIES,
+        compress_on_rollover: bool = True,
+        use_async_io: bool = True,
+        log_format: str = "json",
+        metrics_logger: MetricsLogger = None
+    ):
+        self.log_dir = log_dir
+        self.failed_dir = os.path.join(log_dir, "failed_compression")
+        os.makedirs(self.log_dir, exist_ok=True, mode=0o700)
+        os.makedirs(self.failed_dir, exist_ok=True, mode=0o700)
+        
+        self.buffer = []
+        self.retry_queue = []
+        self.compression_queue = queue.PriorityQueue()
+        self.lock = threading.RLock() # 再入可能ロックに変更
+        self.db_lock = threading.Lock()
+        
+        self.rollover_interval_sec = rollover_interval_sec # タイポ修正
+        self.buffer_max_size = buffer_max_size
+        self.max_retries = max_retries
+        self.compress_on_rollover = compress_on_rollover
+        self.use_async_io = use_async_io and not is_windows()
+        self.log_format = log_format
+        self.metrics_logger = metrics_logger or MetricsLogger(log_dir)
+        
+        self.file_counter = 0
+        self.current_log_filename = self._get_log_filename()
+        self.header_written = {}
+        self.stop_event = threading.Event()
+        
+        self.async_loop = None
+        self.log_async_queue = None
+        if self.use_async_io:
+            self._start_async_loop_thread()
+
+        self.worker_thread = threading.Thread(target=self._worker, daemon=True)
+        self.compression_thread = threading.Thread(target=self._compression_worker, daemon=True)
+        self.worker_thread.start()
+        self.compression_thread.start()
+
+    def _get_log_filename(self) -> str:
+        now = datetime.now()
+        ext = ".json" if self.log_format == "json" else ".csv"
+        # 文字列フォーマット修正
+        base_name = f"tls_log_{now.strftime('%Y%m%d_%H%M%S')}_{self.file_counter:03d}{ext}"
+        self.file_counter += 1
+        return os.path.join(self.log_dir, base_name)
+
+    def _start_async_loop_thread(self):
+        def run_loop():
+            self.async_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self.async_loop)
+            self.log_async_queue = asyncio.Queue()
+            self.cert_async_queue = asyncio.Queue()
+            self.async_loop.run_until_complete(self._handle_async_tasks())
+            self.async_loop.close()
+
+        self.async_thread = threading.Thread(target=run_loop, daemon=True)
+        self.async_thread.start()
+
+    async def _handle_async_tasks(self):
+        while not self.stop_event.is_set() or not self.log_async_queue.empty():
+            try:
+                try:
+                    # Queue.getにタイムアウトを設けてループを回す
+                    task = await asyncio.wait_for(self.log_async_queue.get(), timeout=0.5)
+                    await self._async_write_logs(*task)
+                    self.log_async_queue.task_done()
+                except asyncio.TimeoutError:
+                    pass
+                
+                if hasattr(self, 'cert_async_queue'):
+                    try:
+                        task = await asyncio.wait_for(self.cert_async_queue.get(), timeout=0.1)
+                        await self._async_write_cert(*task)
+                        self.cert_async_queue.task_done()
+                    except asyncio.TimeoutError:
+                        pass
+            except Exception as e:
+                if hasattr(ctx, 'log'): ctx.log.error(f"Async task error: {e}")
+
+    async def _async_write_logs(self, filename: str, logs: list) -> None:
+        async with aiofiles.open(filename, "a", encoding="utf-8") as f:
+            if self.log_format == "json":
+                for entry in logs:
+                    await f.write(json.dumps(entry, sort_keys=True) + '\n')
+            else:
+                if filename not in self.header_written:
+                    await f.write(','.join(self.FIELD_ORDER) + '\n')
+                    self.header_written[filename] = True
+                for entry in logs:
+                    row = ','.join(str(entry.get(k, '')) for k in self.FIELD_ORDER)
+                    await f.write(row + '\n')
+
+    def _worker(self):
+        last_rollover_time = time.time()
+        while not self.stop_event.is_set():
+            now = time.time()
+            if (now - last_rollover_time >= self.rollover_interval_sec):
+                with self.lock:
+                    if self.buffer or self.retry_queue:
+                        old_filename = self.current_log_filename
+                        self._force_flush_all()
+                        self.current_log_filename = self._get_log_filename()
+                        last_rollover_time = now
+                        if self.compress_on_rollover and os.path.exists(old_filename):
+                            self.compression_queue.put((os.path.getmtime(old_filename), old_filename, 0))
+            
+            self._process_retry_queue()
+            time.sleep(1)
+
+        self._force_flush_all()
+        self._process_retry_queue(final_attempt=True)
+
+    def _compression_worker(self):
+        while not self.stop_event.is_set() or not self.compression_queue.empty():
+            try:
+                mtime, filename, retry_count = self.compression_queue.get(timeout=1)
+                if not os.path.exists(filename): continue
+                try:
+                    with open(filename, 'rb') as f_in, gzip.open(filename + '.gz', 'wb') as f_out:
+                        shutil.copyfileobj(f_in, f_out)
+                    os.remove(filename)
+                except Exception as e:
+                    if retry_count < 3:
+                        self.compression_queue.put((mtime, filename, retry_count + 1))
+                    else:
+                        shutil.move(filename, os.path.join(self.failed_dir, os.path.basename(filename)))
+            except queue.Empty:
+                continue
+
+    def log(self, log_entry: dict) -> None:
+        with self.lock:
+            self.buffer.append(log_entry)
+            if len(self.buffer) >= self.buffer_max_size:
+                self._force_flush_logs()
+
+    def _force_flush_logs(self):
+        with self.lock:
+            if not self.buffer: return
+            logs_to_write = list(self.buffer)
+            self.buffer.clear()
+
+            if self.use_async_io and self.async_loop:
+                self.async_loop.call_soon_threadsafe(self.log_async_queue.put_nowait, (self.current_log_filename, logs_to_write))
+            else:
+                try:
+                    with open(self.current_log_filename, "a", encoding="utf-8") as f:
+                        for entry in logs_to_write:
+                            f.write(json.dumps(entry, sort_keys=True) + '\n')
+                except Exception:
+                    self.retry_queue.extend(logs_to_write)
+
+    def _force_flush_all(self):
+        self._force_flush_logs()
+
+    def _process_retry_queue(self, final_attempt: bool = False):
+        with self.lock:
+            if not self.retry_queue: return
+            to_retry = self.retry_queue
+            self.retry_queue = []
+            for entry in to_retry:
+                self.log(entry)
+
+    def stop(self):
+        self.stop_event.set()
+        self.worker_thread.join(timeout=5)
+        self.compression_thread.join(timeout=5)
+        if self.use_async_io and self.async_loop:
+            self.async_loop.call_soon_threadsafe(self.async_loop.stop)
+        self.metrics_logger.stop()
+
+# --- 証明書保存機能付き ---
+
+class BufferedLogWriterWithCerts(BufferedLogWriter):
+    def __init__(self, *args, **kwargs):
+        self.cert_file_permissions = kwargs.pop('cert_file_permissions', 0o600)
+        self.cert_buffer_max_size = kwargs.pop('cert_buffer_max_size', 500)
+        super().__init__(*args, **kwargs)
+        self.cert_queue = []
+        self.saved_cert_files = set()
+        self._init_db()
+
+    def _init_db(self):
+        db_path = os.path.join(self.log_dir, "saved_certs.db")
+        self.conn = sqlite3.connect(db_path, check_same_thread=False)
+        self.conn.execute("CREATE TABLE IF NOT EXISTS saved_certs (filename TEXT PRIMARY KEY, hash TEXT)")
+        self.conn.commit()
+
+    def log_cert(self, cert_info: dict):
+        with self.lock:
+            self.cert_queue.append(cert_info)
+            if len(self.cert_queue) >= self.cert_buffer_max_size:
+                self._flush_cert_queue()
+
+    def _flush_cert_queue(self):
+        with self.lock:
+            if not self.cert_queue: return
+            certs = list(self.cert_queue)
+            self.cert_queue.clear()
+            for c in certs:
+                if c['hash'] not in self.saved_cert_files:
+                    with open(c['filename'], "wb") as f:
+                        f.write(c['pem_bytes'])
+                    self.saved_cert_files.add(c['hash'])
+
+    def _force_flush_all(self):
+        super()._force_flush_all()
+        self._flush_cert_queue()
+
+# --- mitmproxy アドオン ---
+
+class MyTLSAnalyzer:
+    def __init__(self):
+        self.log_writer = BufferedLogWriterWithCerts(
+            log_dir="tls_logs",
+            use_async_io=not is_windows()
+        )
+
+    def done(self):
+        self.log_writer.stop()
+
+    def tls_established(self, flow):
+        common_name = "N/A"
+        if flow.server_conn.peer_certs:
+            cert = flow.server_conn.peer_certs[0]
+            # 公開キーのハッシュなどで一意に識別
+            cert_hash = hashlib.sha256(cert.public_bytes(x509.Encoding.DER)).hexdigest()
+            
+            # ログエントリ作成
+            log_entry = {
+                "timestamp": flow.timestamp_start,
+                # Python 3.12+ 対応
+                "log_time_utc": datetime.fromtimestamp(flow.timestamp_start, timezone.utc).isoformat(),
+                "client_ip": flow.client_conn.peername[0],
+                "server_ip": flow.server_conn.peername[0],
+                "tls_version": flow.tls_version,
+                "cipher_suite": flow.cipher,
+                "sni": getattr(flow.client_hello, 'sni', None)
+            }
+            self.log_writer.log(log_entry)
+            
+            # 証明書の保存
+            cert_info = {
+                "filename": os.path.join("tls_logs", f"cert_{cert_hash[:16]}.pem"),
+                "pem_bytes": cert.public_bytes(x509.Encoding.PEM),
+                "hash": cert_hash
+            }
+            self.log_writer.log_cert(cert_info)
+
+addons = [MyTLSAnalyzer()]
