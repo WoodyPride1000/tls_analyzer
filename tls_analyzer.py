@@ -1,4 +1,3 @@
-
 import json
 import os
 import re
@@ -18,9 +17,10 @@ import stat
 from contextlib import contextmanager
 from cryptography import x509
 from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives.serialization import Encoding
 from cryptography.x509.oid import NameOID
 from mitmproxy import ctx
-from mitmproxy.net import tls
+from mitmproxy.tls import TlsData
 import aiofiles
 import asyncio
 import platform
@@ -187,17 +187,19 @@ class BufferedLogWriter:
         self.buffer = []
         self.retry_queue = []
         self.compression_queue = queue.PriorityQueue()
-        self.lock = threading.Lock()
-        self.db_lock = threading.Lock()
-        self.rollover_interval_sec = rollover_interval
+        # 再入可能ロックに変更。log()がロック保持中に_adjust_buffer_size()が
+        # 同じロックを再取得するため、非再入可能なLockだとデッドロックする。
+        self.lock = threading.RLock()
+        self.db_lock = threading.RLock()
+        self.rollover_interval_sec = rollover_interval_sec
         self.buffer_max_size = buffer_max_size
         self.max_retries = max_retries
         self.compress_on_rollover = compress_on_rollover
         self.use_async_io = use_async_io and not is_windows()
         self.log_format = log_format
         self.metrics_logger = metrics_logger or MetricsLogger(log_dir)
-        self.current_log_filename = self._get_log_filename()
         self.file_counter = 0
+        self.current_log_filename = self._get_log_filename()
         self.header_written = {}
         self.stop_event = threading.Event()
         self.log_async_queue = None
@@ -214,7 +216,7 @@ class BufferedLogWriter:
         """一意なログファイル名を生成。"""
         now = datetime.now()
         ext = ".json" if self.log_format == "json" else ".csv"
-        base_name = f"tls_log_{now.strftime('%Y%m%d_%H%M%S')}_{self.file_counter:03d}{ext}}"
+        base_name = f"tls_log_{now.strftime('%Y%m%d_%H%M%S')}_{self.file_counter:03d}{ext}"
         self.file_counter += 1
         return os.path.join(self.log_dir, base_name)
 
@@ -690,18 +692,28 @@ class MyTLSAnalyzer:
         self.metrics_logger.stop()
         ctx.log.info("MyTLSAnalyzer done.")
 
-    def tls_established(self, flow: tls.TlsFlow):
-        """TLSハンドシェイクを処理。
+    def tls_established_server(self, data: TlsData):
+        """サーバーとのTLSハンドシェイクが完了した際に呼ばれるフック。
+
+        mitmproxyには `tls_established` という名前のフックは存在しない。
+        サーバー側のTLS情報（証明書チェーンなど）が必要な場合は
+        `tls_established_server` を使う必要がある。このフックが渡す
+        `TlsData` は `.conn`（サーバー接続）と `.context`（クライアント接続
+        を含む）のみを持ち、`HTTPFlow`のような`.server_conn`/`.client_conn`
+        属性は持たない。
 
         Args:
-            flow: TLSフローデータ。
+            data: TLSハンドシェイクのイベントデータ。data.conn がサーバー接続。
         """
         common_name = "N/A"
         issuer_common_name = "N/A"
         certs_to_save_data = []
 
-        if flow.server_conn.peer_certs:
-            cert = flow.server_conn.peer_certs[0]
+        server_conn = data.conn
+        client_conn = data.context.client
+
+        if server_conn.certificate_list:
+            cert = server_conn.certificate_list[0].to_cryptography()
             try:
                 subject_cn_attributes = cert.subject.get_attributes_for_oid(NameOID.COMMON_NAME)
                 common_name = subject_cn_attributes[0].value if subject_cn_attributes else "N/A"
@@ -712,56 +724,61 @@ class MyTLSAnalyzer:
                 self.metrics_logger.log_metric("cert_parse_errors", 1)
 
             if common_name == "N/A":
-                common_name = (
-                    flow.client_hello.sni
-                    if hasattr(flow, 'client_hello') and flow.client_hello.sni
-                    else flow.server_conn.peername[0]
+                common_name = server_conn.sni or (
+                    server_conn.peername[0] if server_conn.peername else "unknown"
                 )
 
             if common_name != "N/A":
-                leaf_cert_hash = hashlib.sha256(cert.public_bytes(tls.x509.Encoding.DER)).hexdigest()
-                safe_common_name_prefix = sanitize_filename(common_name, max_length=100)
                 with self.lock:
                     file_counter = self.file_counter
                     self.file_counter += 1
-                for i, current_cert in enumerate(flow.server_conn.peer_certs):
-                    current_cert_hash = hashlib.sha256(current_cert.public_bytes(tls.x509.Encoding.DER)).hexdigest()
+                safe_common_name_prefix = sanitize_filename(common_name, max_length=100)
+                for i, mitm_cert in enumerate(server_conn.certificate_list):
+                    current_cert = mitm_cert.to_cryptography()
+                    current_cert_hash = hashlib.sha256(current_cert.public_bytes(Encoding.DER)).hexdigest()
                     cert_filepath = os.path.join(
                         self.log_writer.log_dir,
                         f"cert_{safe_common_name_prefix}_chain{i:02d}_{current_cert_hash[:16]}_{file_counter:03d}.pem"
                     )
                     certs_to_save_data.append({
                         'filename': cert_filepath,
-                        'pem_bytes': current_cert.public_bytes(tls.x509.Encoding.PEM),
+                        'pem_bytes': current_cert.public_bytes(Encoding.PEM),
                         'hash': current_cert_hash
                     })
 
-        if flow.tls_version in ["TLSv1.2", "TLSv1.3"]:
+        if server_conn.tls_version in ["TLSv1.2", "TLSv1.3"]:
+            handshake_time_ms = None
+            if server_conn.timestamp_tls_setup and server_conn.timestamp_start:
+                handshake_time_ms = float(
+                    server_conn.timestamp_tls_setup - server_conn.timestamp_start
+                ) * 1000
+
             log_entry = {
-                "timestamp": flow.timestamp_start,
-                "log_time_utc": datetime.utcfromtimestamp(flow.timestamp_start).isoformat() + "Z",
-                "client_ip": flow.client_conn.peername[0],
-                "client_port": flow.client_conn.peername[1],
-                "server_ip": flow.server_conn.peername[0],
-                "server_port": flow.server_conn.peername[1],
-                "tls_version": flow.tls_version,
-                "cipher_suite": flow.cipher,
+                "timestamp": server_conn.timestamp_start,
+                "log_time_utc": (
+                    datetime.utcfromtimestamp(server_conn.timestamp_start).isoformat() + "Z"
+                    if server_conn.timestamp_start else None
+                ),
+                "client_ip": client_conn.peername[0] if client_conn.peername else None,
+                "client_port": client_conn.peername[1] if client_conn.peername else None,
+                "server_ip": server_conn.peername[0] if server_conn.peername else None,
+                "server_port": server_conn.peername[1] if server_conn.peername else None,
+                "tls_version": server_conn.tls_version,
+                "cipher_suite": server_conn.cipher,
                 "server_common_name": common_name,
                 "issuer_common_name": issuer_common_name,
-                "handshake_time_ms": float(flow.tls_handshake_end - flow.tls_handshake_start) * 1000,
-                "sni": flow.client_hello.sni if hasattr(flow, 'client_hello') and flow.client_hello else None,
-                "tls_extensions": (
-                    [str(ext) for ext in flow.client_hello.extensions]
-                    if hasattr(flow, 'client_hello') and hasattr(flow.client_hello, 'extensions')
-                    else None
-                )
+                "handshake_time_ms": handshake_time_ms,
+                "sni": server_conn.sni,
+                # TlsData には ClientHello の拡張情報が含まれないため取得不可。
+                # 必要なら tls_clienthello フックを別途実装して突き合わせる。
+                "tls_extensions": None
             }
             self.log_writer.log(log_entry)
-            ctx.log.debug(f"Queued {flow.tls_version} session for {flow.server_conn.peername}")
+            ctx.log.debug(f"Queued {server_conn.tls_version} session for {server_conn.peername}")
             for cert_data in certs_to_save_data:
                 self.log_writer.log_cert(cert_data)
         else:
-            ctx.log.debug(f"Non-TLSv1.2/1.3 session: {flow.tls_version}")
+            ctx.log.debug(f"Non-TLSv1.2/1.3 session: {server_conn.tls_version}")
 
 # --- テストコード ---
 
@@ -895,24 +912,28 @@ class TestBufferedLogWriterWithCerts(unittest.TestCase):
         with self.assertRaises(TypeError):
             BufferedLogWriterWithCerts(log_dir=self.log_dir, rollover_interval_sec="300")
 
-    @patch('cryptography.x509.load_pem_x509_certificate')
-    def test_tls_established_issuer_common_name(self, mock_load_cert):
+    def test_tls_established_issuer_common_name(self):
         """issuer_common_nameの取得をテスト。"""
-        mock_cert = Mock()
-        mock_cert.subject.get_attributes_for_oid.return_value = [Mock(value="test_subject")]
-        mock_cert.issuer.get_attributes_for_oid.return_value = [Mock(value="test_issuer")]
-        mock_load_cert.return_value = mock_cert
-        flow = Mock()
-        flow.server_conn.peer_certs = [mock_cert]
-        flow.tls_version = "TLSv1.3"
-        flow.timestamp_start = 1234567890
-        flow.client_conn.peername = ("192.168.1.1", 12345)
-        flow.server_conn.peername = ("93.184.216.34", 443)
-        flow.cipher = "TLS_AES_256_GCM_SHA384"
-        flow.tls_handshake_end = 1234567890.025
-        flow.tls_handshake_start = 1234567890.0
+        mock_cert_obj = Mock()
+        mock_cert_obj.subject.get_attributes_for_oid.return_value = [Mock(value="test_subject")]
+        mock_cert_obj.issuer.get_attributes_for_oid.return_value = [Mock(value="test_issuer")]
+        mock_cert_obj.public_bytes.return_value = b"dummy_der_or_pem_bytes"
+
+        mock_mitm_cert = Mock()
+        mock_mitm_cert.to_cryptography.return_value = mock_cert_obj
+
+        data = Mock()
+        data.conn.certificate_list = [mock_mitm_cert]
+        data.conn.tls_version = "TLSv1.3"
+        data.conn.timestamp_start = 1234567890.0
+        data.conn.timestamp_tls_setup = 1234567890.025
+        data.conn.peername = ("93.184.216.34", 443)
+        data.conn.cipher = "TLS_AES_256_GCM_SHA384"
+        data.conn.sni = "example.com"
+        data.context.client.peername = ("192.168.1.1", 12345)
+
         analyzer = MyTLSAnalyzer()
-        analyzer.tls_established(flow)
+        analyzer.tls_established_server(data)
         analyzer.log_writer.stop()
 
     def test_retry_attempt_counting(self):
